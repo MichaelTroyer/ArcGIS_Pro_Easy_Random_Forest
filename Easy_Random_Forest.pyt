@@ -47,11 +47,12 @@ import re
 import traceback
 import pandas as pd
 import numpy as np
+import random
 import arcpy
 import random_forest
 
 
-
+#--- Helper Functions --------------------------------------------------------------------------------------------------
 def get_acres(fc):
     """Check for an acres field in fc - create if doesn't exist or flag for calculation.
        Recalculate acres and return name of acre field"""
@@ -104,10 +105,15 @@ def one_hot_dataframe(dataframe, one_hot_columns):
     return dataframe.join(one_hot_dfs)
 
 
+#--- Custom Exceptions ------------------------------------------------------------------------------------------------
 class InsufficientSurveyCoverage (BaseException): pass
-class InsufficientSiteSample     (BaseException): pass
+class InsufficientSiteSample (BaseException): pass
+class ExcessPoints (BaseException): pass
+class GuessedTheMean (BaseException): pass
 
 
+
+#--- Main Program -----------------------------------------------------------------------------------------------------
 class Toolbox(object):
     def __init__(self):
         self.label = "Easy Random Forest Toolbox"
@@ -202,6 +208,7 @@ class Easy_Random_Forest(object):
             displayName="Analysis Feature Classes",
             name="Analysis_Feature_Classes",
             datatype="GPValueTable",
+            parameterType='Optional',
             )
         analysis_features.columns = [['DEFeatureClass', 'Feature Class'], ['GPString', 'Field']]
         analysis_features.filters[1].type = 'ValueList'
@@ -212,6 +219,7 @@ class Easy_Random_Forest(object):
             displayName="Analysis Rasters",
             name="Analysis_Rasters",
             datatype="DERasterDataset",
+            parameterType='Optional',
             multiValue=True,
             )
 
@@ -364,12 +372,12 @@ class Easy_Random_Forest(object):
             analysis_fields.sort()
             analysis_features.filters[1].list = analysis_fields
 
-        if not sample_spacing.altered: sample_spacing.value = 100
-        if not n_trees.altered: n_trees.value = 10
-        if not max_depth.altered: max_depth.value = 10
+        if not sample_spacing.altered: sample_spacing.value = 50
+        if not n_trees.altered: n_trees.value = 5
+        if not max_depth.altered: max_depth.value = 5
         if not sample_prop.altered: sample_prop.value = 0.2
         if not min_split.altered: min_split.value = 10
-        if not k_folds.altered: k_folds.value = 5
+        if not k_folds.altered: k_folds.value = 3
         if not test_proportion.altered: test_proportion.value = 0.2
         if not random_seed.altered: random_seed.value = 42
 
@@ -388,8 +396,9 @@ class Easy_Random_Forest(object):
                     error_msg = ("Field [{}] not found in feature class [{}]".format(val, os.path.basename(str(fc))))
                     analysis_features.setErrorMessage(error_msg)
 
-            fc_paths = [str(path) for path, _ in analysis_features.values]
-            fc_fields = [str(field) for _, field in analysis_features.values]
+            fc_paths, fc_fields = zip(*[(str(path), str(field)) for path, field in analysis_features.values])
+            # fc_paths = [str(path) for path, _ in analysis_features.values]
+            # fc_fields = [str(field) for _, field in analysis_features.values]
 
             if len(set(fc_paths)) != len(fc_paths):
                 err_mg = ("Duplicate input feature classes: the same feature class cannnot be used more than once.")
@@ -412,6 +421,12 @@ class Easy_Random_Forest(object):
             err_mg = ("Validation Test Proportion must be a number between 0 and 0.5")
             sample_prop.setErrorMessage(err_mg)
 
+        # If output is supplied but no input analysis features were identifed.
+        if output_folder.value and (not analysis_features.value and not analysis_rasters.value):
+            err_mg = ("No input feature classes or rasters supplied for analysis.")
+            analysis_features.setErrorMessage(err_mg)
+            analysis_rasters.setErrorMessage(err_mg)
+
         return
 
 
@@ -423,10 +438,9 @@ class Easy_Random_Forest(object):
         output_folder,
         ) = params
 
-        for param in params:
-            arcpy.AddMessage(f'{param.name}: {param.value}')
-
-        # TODO: Make sure at least one feature or raster supplied
+        # Seed the RNG
+        # BUG: this is not setting the seed thoughout - probably losing the seed on import random_forest
+        random.seed(random_seed.value)
 
         try:
             #--- Create Geodatabase ----------------------------------------------------------------------------------------------
@@ -454,7 +468,7 @@ class Easy_Random_Forest(object):
             analysis_area = os.path.join(gdb_path, 'Analysis_Area')
             arcpy.CopyFeatures_management(input_analysis_area.value, analysis_area)
             analysis_acres_total = get_acres(analysis_area)['Acres_Sum']
-            print('\nTotal acres within analysis area: {}\n'.format(round(analysis_acres_total, 4)))
+            arcpy.AddMessage(f'Total acres within analysis area: {round(analysis_acres_total, 4)}')
 
             #--- Get Survey Data --------------------------------------------------------------------------------------
 
@@ -520,6 +534,7 @@ class Easy_Random_Forest(object):
             ymax = desc.extent.YMax
 
             # Create fishnet
+            arcpy.AddMessage('Creating sample point cloud')
             fishnet_poly = os.path.join(gdb_path, 'Fishnet')
             fishnet_points = os.path.join(gdb_path, 'Fishnet_label')
             sample_points = os.path.join(gdb_path, 'Sample_Points')
@@ -542,10 +557,13 @@ class Easy_Random_Forest(object):
             site_points = os.path.join(gdb_path, 'Site_Points')
 
             # Over sample the sites to ensure coverage - class balancing
+            site_acres_total = get_acres(analysis_sites)['Acres_Sum']
+            site_sample_points_per_acres = 10
             arcpy.management.CreateRandomPoints(
                 out_path=gdb_path,
                 out_name=os.path.basename(site_points),
                 constraining_feature_class=analysis_sites,
+                number_of_points_or_field=(site_acres_total * site_sample_points_per_acres) / site_count,
                 minimum_allowed_distance="{} Meters".format(np.sqrt(sample_spacing.value)),
                 )
 
@@ -553,11 +571,21 @@ class Easy_Random_Forest(object):
             arcpy.management.Append(site_points, sample_points, 'NO_TEST')
             arcpy.management.Delete(site_points)
 
+            n_points = int(arcpy.GetCount_management(sample_points).getOutput(0))
+            arcpy.AddMessage(f'{n_points} sample points created')
+            arcpy.AddMessage(f'Sample point density (points/acre): {round(n_points / analysis_acres_total, 2)}')
+
+            # TODO: is this an appropriate upper limit??
+            if n_points > 1000000:
+                raise ExcessPoints
+
+
         #--- Data Attribution -----------------------------------------------------------------------------------------
 
-            # Feature Classes ---------------------------------------------
+            # Feature Classes ---------------------------------------------------------------------
             if analysis_features.value:
 
+                arcpy.AddMessage('Gathering feature class attribute data')
                 analysis_feature_classes, analysis_feature_fields = zip(*analysis_features.values)
                 analysis_points = os.path.join(gdb_path, 'Analysis_Points')
 
@@ -571,17 +599,16 @@ class Easy_Random_Forest(object):
                 # clean up fields
                 for field in arcpy.ListFields(analysis_points):
                     if field.name not in analysis_feature_fields:
-                        try:
-                            arcpy.DeleteField_management(analysis_points, field.name)
-                        except:
-                            pass
+                        arcpy.DeleteField_management(analysis_points, field.name)
 
-            # Rasters -----------------------------------------------------
+            # Rasters -----------------------------------------------------------------------------
             if analysis_rasters.value:
+                arcpy.AddMessage('Gathering raster attribute data')
                 arcpy.sa.ExtractMultiValuesToPoints(analysis_points, analysis_rasters.valueAsText.split(';'))
 
         #--- Isolate test/train and prediction datasets ---------------------------------------------------------------
 
+            arcpy.AddMessage('Preparing the point data for analysis')
             # Add class ID field
             class_field = 'Site_Point'
             arcpy.management.AddField(analysis_points, class_field, 'Short')
@@ -595,13 +622,19 @@ class Easy_Random_Forest(object):
 
             # Encode site points
             arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_sites)
+            site_points = int(arcpy.GetCount_management(analysis_points_lyr).getOutput(0))
             arcpy.management.CalculateField(analysis_points_lyr, class_field, '1')
+
             arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_sites, invert_spatial_relationship=True)
+            non_site_points = int(arcpy.GetCount_management(analysis_points_lyr).getOutput(0))
             arcpy.management.CalculateField(analysis_points_lyr, class_field, '0')
 
             arcpy.management.Delete(analysis_points_lyr)
 
         #--- Random Forest --------------------------------------------------------------------------------------------
+
+            arcpy.AddMessage('Preparing the model')
+            arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
 
             # Prep the dataframe
             df = feature_class_to_data_frame(analysis_points)
@@ -631,8 +664,9 @@ class Easy_Random_Forest(object):
             # TODO: Parameritize this??
             n_features = int(math.sqrt(len(train_dataset[0])-1))
 
-            # TODO: make this optional
+            # TODO: make this optional?
             # K-Fold cross-validation
+            arcpy.AddMessage('Cross-validating model')
             cross_validation_scores = random_forest.cross_validate(
                 train_dataset,
                 k_folds.value,
@@ -642,35 +676,43 @@ class Easy_Random_Forest(object):
                 n_trees.value,
                 n_features
                 )
-            arcpy.AddMessage(f'Cross-Validation Scores: f{cross_validation_scores}')
+            arcpy.AddMessage(f'Cross-Validation Scores: {cross_validation_scores}')
 
             # Build the final model on the whole training set
-            final_model, final_predictions = random_forest(
+            arcpy.AddMessage('Building the final model')
+            final_model, final_predictions = random_forest.random_forest(
                 train_dataset,
                 test_dataset,
-                max_depth,
-                min_size,
-                sample_proportion,
-                n_trees,
+                max_depth.value,
+                min_split.value,
+                sample_prop.value,
+                n_trees.value,
                 n_features,
                 )
             # Final accuracy metric
             confusion_matrix = random_forest.confusion_matrix(test_actuals, final_predictions)
-
+            confusion_matrix_norm = random_forest.confusion_matrix(test_actuals, final_predictions, normalize=True)
             arcpy.AddMessage(confusion_matrix)
+            arcpy.AddMessage(confusion_matrix_norm)
+
+            # Guard against no site predictions - throws list index error..
+            if len(set(final_predictions)) == 1:
+                raise GuessedTheMean
 
             # Predict the unsurveyed areas
+            arcpy.AddMessage('Adding predictions to unsurveyed areas')
             prediction_points_df = feature_class_to_data_frame(prediction_points)
-            prediction_points_df.drop(columns=[class_field], inplace=True)
+            prediction_points_df.to_csv(os.path.join(output_folder.valueAsText, 'Prediction_df.csv'))
+
+            # prediction_points_df.drop(columns=[class_field], inplace=True)
             prediction_dataset = prediction_points_df.values.tolist()
-            predictions = predict_dataset(final_model, prediction_dataset)
+            predictions = random_forest.predict_dataset(final_model, prediction_dataset)
 
             # join predictions to original point data
             with arcpy.da.UpdateCursor(prediction_points, class_field) as cur:
                 for ix, row in enumerate(cur):
                     row = predictions[ix]
                     cur.updateRow(row)
-
 
         #--- Error Handling -------------------------------------------------------------------------------------------
 
@@ -685,6 +727,21 @@ class Easy_Random_Forest(object):
             msg = (
                 "Too few sites in analysis area.\n"
                 "Model requires a minimum of 30 sites for analysis.\n"
+                "[exiting program]")
+            arcpy.AddError(msg)
+
+        except ExcessPoints:
+            msg = (
+                "Too many points requested for analaysis.\n"
+                "Adjust your sample spacing and try again.\n"
+                "[exiting program]")
+            arcpy.AddError(msg)
+
+        except GuessedTheMean:
+            msg = (
+                "Final model simply guessed the mean.\n"
+                "Your feature class and raster inputs do not appear to have much predictive potential.\n"
+                "Try adding new prediction feature classes or rasters and/or adjusting your sample spacing.\n"
                 "[exiting program]")
             arcpy.AddError(msg)
 
