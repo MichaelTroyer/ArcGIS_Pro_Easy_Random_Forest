@@ -579,7 +579,6 @@ class Easy_Random_Forest(object):
             if n_points > 1000000:
                 raise ExcessPoints
 
-
         #--- Data Attribution -----------------------------------------------------------------------------------------
 
             # Feature Classes ---------------------------------------------------------------------
@@ -598,7 +597,7 @@ class Easy_Random_Forest(object):
 
                 # clean up fields
                 for field in arcpy.ListFields(analysis_points):
-                    if field.name not in analysis_feature_fields:
+                    if field.name not in analysis_feature_fields + ('OBJECTID', 'Shape'):
                         arcpy.DeleteField_management(analysis_points, field.name)
 
             # Rasters -----------------------------------------------------------------------------
@@ -606,39 +605,55 @@ class Easy_Random_Forest(object):
                 arcpy.AddMessage('Gathering raster attribute data')
                 arcpy.sa.ExtractMultiValuesToPoints(analysis_points, analysis_rasters.valueAsText.split(';'))
 
-        #--- Isolate test/train and prediction datasets ---------------------------------------------------------------
+        #--- Prep the dataframes --------------------------------------------------------------------------------------
 
-            arcpy.AddMessage('Preparing the point data for analysis')
+            arcpy.AddMessage('Preparing the model')
+
             # Add class ID field
             class_field = 'Site_Point'
             arcpy.management.AddField(analysis_points, class_field, 'Short')
 
-            # Extract the prediction points
-            prediction_points = os.path.join(gdb_path, 'Prediction_Points')
+            # Add Surveyed / Prediction field
+            predict_field = 'Predict'
+            arcpy.management.AddField(analysis_points, predict_field, 'Short')
+
             analysis_points_lyr = arcpy.management.MakeFeatureLayer(analysis_points, 'memory\\analysis_points')
-            arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_surveys, invert_spatial_relationship=True)
-            arcpy.management.CopyFeatures(analysis_points_lyr, prediction_points)
-            arcpy.management.DeleteFeatures(analysis_points_lyr)
 
             # Encode site points
             arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_sites)
             site_points = int(arcpy.GetCount_management(analysis_points_lyr).getOutput(0))
             arcpy.management.CalculateField(analysis_points_lyr, class_field, '1')
 
+            # Encode non-site points
             arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_sites, invert_spatial_relationship=True)
             non_site_points = int(arcpy.GetCount_management(analysis_points_lyr).getOutput(0))
             arcpy.management.CalculateField(analysis_points_lyr, class_field, '0')
 
-            arcpy.management.Delete(analysis_points_lyr)
+            # Encode Surveyed points
+            arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_surveys)
+            arcpy.management.CalculateField(analysis_points_lyr, predict_field, '0')
 
-        #--- Random Forest --------------------------------------------------------------------------------------------
+            # Encode Prediction (non-surveyd) points
+            arcpy.management.SelectLayerByLocation(analysis_points_lyr, 'INTERSECT', analysis_surveys, invert_spatial_relationship=True)
+            arcpy.management.CalculateField(analysis_points_lyr, predict_field, '1')
 
-            arcpy.AddMessage('Preparing the model')
-            arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
+            # Create the prediction point feature class
+            prediction_points = os.path.join(gdb_path, 'Prediction_points')
+            arcpy.management.CopyFeatures(analysis_points_lyr, prediction_points)
+            for field in (class_field, predict_field):
+                arcpy.DeleteField_management(prediction_points, field)
+
 
             # Prep the dataframe
             df = feature_class_to_data_frame(analysis_points)
             df.drop(columns=['Shape'], inplace=True)
+
+            # Delete the prediction points and delete layer view
+            arcpy.management.DeleteFeatures(analysis_points_lyr)
+            arcpy.management.Delete(analysis_points_lyr)
+
+            # Clean up analysis points fields
+            arcpy.DeleteField_management(analysis_points, predict_field)
 
             # Try to coerce strings to numbers
             string_columns = df.select_dtypes(include=['object', 'category']).columns
@@ -648,21 +663,41 @@ class Easy_Random_Forest(object):
             one_hot_columns = df.select_dtypes(include=['object', 'category']).columns
             df = one_hot_dataframe(df, one_hot_columns)
 
+            # Remove the prediction set
+            predict_df = df[df[predict_field] == 1]
+            predict_df.drop(columns=[predict_field], inplace=True)
+            df = df.drop(predict_df.index)
+            df.drop(columns=[predict_field], inplace=True)
+
             # Create the Train / Test split
-            test_df = df.sample(frac=test_proportion.value, random_state=random_seed.value)
+            weights = df.groupby(class_field).count() * test_proportion.value
+            neg_class_test_df = df[df[class_field] == 0].sample(int(weights.loc[0][0]), random_state=random_seed.value)
+            pos_class_test_df = df[df[class_field] == 1].sample(int(weights.loc[1][0]), random_state=random_seed.value)
+            test_df = pd.concat([neg_class_test_df, pos_class_test_df])
             train_df = df.drop(test_df.index)
 
             train_df.to_csv(os.path.join(output_folder.valueAsText, 'Train_df.csv'))
             test_df.to_csv(os.path.join(output_folder.valueAsText, 'Test_df.csv'))
+            predict_df.to_csv(os.path.join(output_folder.valueAsText, 'Prediction_df.csv'))
 
+            # Get train data as a list of lists
             train_dataset = train_df.values.tolist()
 
+            # Remove class labels and get test data as a list of lists
             test_actuals = test_df[class_field].values.tolist()
             test_df.drop(columns=[class_field], inplace=True)
             test_dataset = test_df.values.tolist()
 
-            # TODO: Parameritize this??
+            # # TODO: Parameritize this??
             n_features = int(math.sqrt(len(train_dataset[0])-1))
+
+            arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
+            site_class_proportion = (site_points / non_site_points)
+            site_class_percentage = round(site_class_proportion * 100, 2)
+            non_site_class_percentage = round(100 - site_class_percentage, 2)
+            arcpy.AddMessage(f'Class balance: {site_class_percentage}% site points, {non_site_class_percentage}% non-site points')
+
+        # --- Random Forest --------------------------------------------------------------------------------------------
 
             # TODO: make this optional?
             # K-Fold cross-validation
@@ -691,9 +726,7 @@ class Easy_Random_Forest(object):
                 )
             # Final accuracy metric
             confusion_matrix = random_forest.confusion_matrix(test_actuals, final_predictions)
-            confusion_matrix_norm = random_forest.confusion_matrix(test_actuals, final_predictions, normalize=True)
             arcpy.AddMessage(confusion_matrix)
-            arcpy.AddMessage(confusion_matrix_norm)
 
             # Guard against no site predictions - throws list index error..
             if len(set(final_predictions)) == 1:
@@ -701,18 +734,21 @@ class Easy_Random_Forest(object):
 
             # Predict the unsurveyed areas
             arcpy.AddMessage('Adding predictions to unsurveyed areas')
-            prediction_points_df = feature_class_to_data_frame(prediction_points)
-            prediction_points_df.to_csv(os.path.join(output_folder.valueAsText, 'Prediction_df.csv'))
-
-            # prediction_points_df.drop(columns=[class_field], inplace=True)
-            prediction_dataset = prediction_points_df.values.tolist()
+            predict_df.drop(columns=[class_field], inplace=True)
+            prediction_dataset = predict_df.values.tolist()
             predictions = random_forest.predict_dataset(final_model, prediction_dataset)
 
+            # TODO: Introspect predictions
+
             # join predictions to original point data
-            with arcpy.da.UpdateCursor(prediction_points, class_field) as cur:
+            final_predict_field = 'Final_Prediction'
+            arcpy.management.AddField(prediction_points, final_predict_field, 'Short')
+            # TODO: Does this maintain the correct order??
+            with arcpy.da.UpdateCursor(prediction_points, final_predict_field) as cur:
                 for ix, row in enumerate(cur):
-                    row = predictions[ix]
+                    row[0] = predictions[ix]
                     cur.updateRow(row)
+
 
         #--- Error Handling -------------------------------------------------------------------------------------------
 

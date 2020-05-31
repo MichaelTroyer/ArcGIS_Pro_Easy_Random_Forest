@@ -204,11 +204,9 @@ def cross_validate(dataset, n_folds, max_depth, min_size, sample_proportion, n_t
     return scores
 
 
-def confusion_matrix(actual, predicted, normalize=False):
+    #TODO: need to add F1 and others
+def confusion_matrix(actual, predicted):
     y_actu = pd.Series(actual, name='Actual')
     y_pred = pd.Series(predicted, name='Predicted')
     conf_matx = pd.crosstab(y_actu, y_pred, rownames=['Actual'], colnames=['Predicted'], margins=True)
-    if not normalize:
-        return conf_matx
-    else:
-        return conf_matx / conf_matx.sum(axis=1)
+    return conf_matx
