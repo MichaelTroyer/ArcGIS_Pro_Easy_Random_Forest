@@ -700,7 +700,7 @@ class Easy_Random_Forest(object):
 
             # Max Features - must be less than number of features in df
             # TODO: Enforce don't use all? - SHould this even be an option?
-            n_features = min(max_features, len(train_dataset[0] - 1))
+            n_features = min(max_features.value, len(train_dataset[0]) - 1)
             # n_features = int(math.sqrt(len(train_dataset[0])-1))
 
             arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
