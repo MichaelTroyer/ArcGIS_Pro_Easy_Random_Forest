@@ -244,6 +244,12 @@ class Easy_Random_Forest(object):
             datatype="Long",
             )
 
+        max_features=arcpy.Parameter(
+            displayName="Maximum Features",
+            name="Maximum_Features",
+            datatype="Long",
+            )
+
         # Sample sizes
         sample_prop=arcpy.Parameter(
             displayName="Bootstrap Sample Proportion",
@@ -290,7 +296,7 @@ class Easy_Random_Forest(object):
             input_analysis_area,
             surveys, surveys_filter, surveys_filter_field, surveys_filter_value,
             sites, sites_filter, sites_filter_field, sites_filter_value, analysis_features, analysis_rasters,
-            sample_spacing, n_trees, max_depth, sample_prop, min_split, k_folds, test_proportion, random_seed,
+            sample_spacing, n_trees, max_depth, max_features, sample_prop, min_split, k_folds, test_proportion, random_seed,
             output_folder,
             ]
 
@@ -303,7 +309,7 @@ class Easy_Random_Forest(object):
         (input_analysis_area,
         surveys, surveys_filter, surveys_filter_field, surveys_filter_value,
         sites, sites_filter, sites_filter_field, sites_filter_value, analysis_features, analysis_rasters,
-        sample_spacing, n_trees, max_depth, sample_prop, min_split, k_folds, test_proportion, random_seed,
+        sample_spacing, n_trees, max_depth, max_features, sample_prop, min_split, k_folds, test_proportion, random_seed,
         output_folder,
         ) = params
 
@@ -375,6 +381,7 @@ class Easy_Random_Forest(object):
         if not sample_spacing.altered: sample_spacing.value = 50
         if not n_trees.altered: n_trees.value = 5
         if not max_depth.altered: max_depth.value = 5
+        if not max_features.altered: max_features.value = 5
         if not sample_prop.altered: sample_prop.value = 0.2
         if not min_split.altered: min_split.value = 10
         if not k_folds.altered: k_folds.value = 3
@@ -386,7 +393,7 @@ class Easy_Random_Forest(object):
         (input_analysis_area,
         surveys, surveys_filter, surveys_filter_field, surveys_filter_value,
         sites, sites_filter, sites_filter_field, sites_filter_value, analysis_features, analysis_rasters,
-        sample_spacing, n_trees, max_depth, sample_prop, min_split, k_folds, test_proportion, random_seed,
+        sample_spacing, n_trees, max_depth, max_features, sample_prop, min_split, k_folds, test_proportion, random_seed,
         output_folder,
         ) = params
 
@@ -434,7 +441,7 @@ class Easy_Random_Forest(object):
         (input_analysis_area,
         surveys, surveys_filter, surveys_filter_field, surveys_filter_value,
         sites, sites_filter, sites_filter_field, sites_filter_value, analysis_features, analysis_rasters,
-        sample_spacing, n_trees, max_depth, sample_prop, min_split, k_folds, test_proportion, random_seed,
+        sample_spacing, n_trees, max_depth, max_features, sample_prop, min_split, k_folds, test_proportion, random_seed,
         output_folder,
         ) = params
 
@@ -575,8 +582,7 @@ class Easy_Random_Forest(object):
             arcpy.AddMessage(f'{n_points} sample points created')
             arcpy.AddMessage(f'Sample point density (points/acre): {round(n_points / analysis_acres_total, 2)}')
 
-            # TODO: is this an appropriate upper limit??
-            if n_points > 1000000:
+            if n_points > 250000:
                 raise ExcessPoints
 
         #--- Data Attribution -----------------------------------------------------------------------------------------
@@ -643,7 +649,6 @@ class Easy_Random_Forest(object):
             for field in (class_field, predict_field):
                 arcpy.DeleteField_management(prediction_points, field)
 
-
             # Prep the dataframe
             df = feature_class_to_data_frame(analysis_points)
             df.drop(columns=['Shape'], inplace=True)
@@ -663,13 +668,18 @@ class Easy_Random_Forest(object):
             one_hot_columns = df.select_dtypes(include=['object', 'category']).columns
             df = one_hot_dataframe(df, one_hot_columns)
 
+            # Move the class_field data to the end of the DF where the RF will expect it!
+            class_field_series = df[class_field]
+            df.drop(columns=[class_field], inplace=True)
+            df[class_field] = class_field_series
+
             # Remove the prediction set
             predict_df = df[df[predict_field] == 1]
             predict_df.drop(columns=[predict_field], inplace=True)
             df = df.drop(predict_df.index)
             df.drop(columns=[predict_field], inplace=True)
 
-            # Create the Train / Test split
+            # Create the Train / Test split - weighted to ensure representation of each class
             weights = df.groupby(class_field).count() * test_proportion.value
             neg_class_test_df = df[df[class_field] == 0].sample(int(weights.loc[0][0]), random_state=random_seed.value)
             pos_class_test_df = df[df[class_field] == 1].sample(int(weights.loc[1][0]), random_state=random_seed.value)
@@ -688,8 +698,10 @@ class Easy_Random_Forest(object):
             test_df.drop(columns=[class_field], inplace=True)
             test_dataset = test_df.values.tolist()
 
-            # # TODO: Parameritize this??
-            n_features = int(math.sqrt(len(train_dataset[0])-1))
+            # Max Features - must be less than number of features in df
+            # TODO: Enforce don't use all? - SHould this even be an option?
+            n_features = min(max_features, len(train_dataset[0] - 1))
+            # n_features = int(math.sqrt(len(train_dataset[0])-1))
 
             arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
             site_class_proportion = (site_points / non_site_points)
@@ -738,7 +750,9 @@ class Easy_Random_Forest(object):
             prediction_dataset = predict_df.values.tolist()
             predictions = random_forest.predict_dataset(final_model, prediction_dataset)
 
-            # TODO: Introspect predictions
+            arcpy.AddMessage(
+                f'Unsurveyed area predictions: {predictions.count(1)} sites points, {predictions.count(0)} non-site points'
+                )
 
             # join predictions to original point data
             final_predict_field = 'Final_Prediction'
