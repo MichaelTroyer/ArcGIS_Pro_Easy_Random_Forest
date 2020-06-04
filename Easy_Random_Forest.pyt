@@ -31,28 +31,26 @@ Michael Troyer
 michael.troyer@usda.gov
 5/27/2020
 
-Purpose:
+Purpose: Model stuff..
 
-Credits:
-
-Todo:
 
 
 """
 
 
-import datetime
-import math
-import re
+import os
 import traceback
 import pandas as pd
-import numpy as np
-import random
 import arcpy
-import random_forest
+
+from datetime import datetime
+from re import sub
+from math import sqrt
+from random import seed, randrange
 
 
 #--- Helper Functions --------------------------------------------------------------------------------------------------
+
 def get_acres(fc):
     """Check for an acres field in fc - create if doesn't exist or flag for calculation.
        Recalculate acres and return name of acre field"""
@@ -105,15 +103,251 @@ def one_hot_dataframe(dataframe, one_hot_columns):
     return dataframe.join(one_hot_dfs)
 
 
+# Random Forest Functions ---------------------------------------------------------------------------------------------
+
+# Create a random subsample from the dataset with replacement
+def subsample(dataset, sample_proportion):
+    sample = list()
+    n_sample = round(len(dataset) * sample_proportion)
+    while len(sample) < n_sample:
+        index = randrange(len(dataset))
+        sample.append(dataset[index])
+    return sample
+
+
+# Split a dataset based on an attribute and an attribute value
+def test_split(index, value, dataset):
+    left, right = list(), list()
+    for row in dataset:
+        if row[index] < value:
+            left.append(row)
+        else:
+            right.append(row)
+    return left, right
+
+
+# Select the best split point for a dataset
+def get_best_split(dataset, n_features):
+    # Last column is the class ID
+    class_values = list(set(row[-1] for row in dataset))
+    b_index, b_value, b_score, b_groups = 999, 999, 999, None
+    features = list()
+    while len(features) < n_features:
+        index = randrange(len(dataset[0])-1)
+        if index not in features:
+            features.append(index)
+    for index in features:
+        for row in dataset:
+            groups = test_split(index, row[index], dataset)
+            gini = gini_index(groups, class_values)
+            if gini < b_score:
+                b_index, b_value, b_score, b_groups = index, row[index], gini, groups
+    return {'index': b_index, 'value': b_value, 'groups': b_groups}
+
+# Check if a split group is all the same class
+def is_homogeneous(group):
+    return True if len({row[-1] for row in group}) == 1 else False
+
+
+# Create a terminal node value
+def to_terminal(group):
+    # At a root node - return most frequent class
+    outcomes = [row[-1] for row in group]
+    return max(set(outcomes), key=outcomes.count)
+
+
+# Calculate the Gini index for a split dataset
+def gini_index(groups, classes):
+    # count all samples at split point
+    n_instances = float(sum([len(group) for group in groups]))
+    # sum weighted Gini index for each group
+    gini = 0.0
+    for group in groups:
+        size = float(len(group))
+        # avoid divide by zero
+        if size == 0:
+            continue
+        score = 0.0
+        # score the group based on the score for each class
+        for class_val in classes:
+            p = [row[-1] for row in group].count(class_val) / size
+            score += p * p
+        # weight the group score by its relative size
+        gini += (1.0 - score) * (size / n_instances)
+    return gini
+
+
+# Make a prediction with a decision tree
+def predict(node, row):
+    # less than = left
+    if row[node['index']] < node['value']:
+        if isinstance(node['left'], dict):
+            return predict(node['left'], row)
+        else:
+            # Terminal nodes are not dicts, but values
+            return node['left']
+    else:
+        if isinstance(node['right'], dict):
+            return predict(node['right'], row)
+        else:
+            return node['right']
+
+
+# Create child splits for a node or make terminal
+def split(node, max_depth, min_size, n_features, depth):
+    left, right = node['groups']
+    del(node['groups'])
+    # check for a no split
+    if not left or not right:
+        node['left'] = node['right'] = to_terminal(left + right)
+        return
+    # check for max depth
+    if depth >= max_depth:
+        node['left'], node['right'] = to_terminal(left), to_terminal(right)
+        return
+    # process left child
+    if is_homogeneous(left) or len(left) <= min_size:
+        node['left'] = to_terminal(left)
+    else:
+        node['left'] = get_best_split(left, n_features)
+        split(node['left'], max_depth, min_size, n_features, depth+1)
+    # process right child
+    if is_homogeneous(right) or len(right) <= min_size:
+        node['right'] = to_terminal(right)
+    else:
+        node['right'] = get_best_split(right, n_features)
+        split(node['right'], max_depth, min_size, n_features, depth+1)
+
+
+# Build a decision tree
+def build_tree(train, max_depth, min_size, n_features):
+    root = get_best_split(train, n_features)
+    split(root, max_depth, min_size, n_features, 1)
+    return root
+
+
+# Make a prediction with a list of bagged trees
+def bagging_predict(trees, row):
+    predictions = [predict(tree, row) for tree in trees]
+    return max(set(predictions), key=predictions.count)
+
+
+# Random Forest Algorithm
+def random_forest(train, test, max_depth, min_size, sample_proportion, n_trees, n_features):
+    trees = list()
+    for i in range(n_trees):
+        sample = subsample(train, sample_proportion)
+        tree = build_tree(sample, max_depth, min_size, n_features)
+        trees.append(tree)
+    predictions = [bagging_predict(trees, row) for row in test]
+    return (trees, predictions)
+
+
+def predict_dataset(trees, rows):
+    return [bagging_predict(trees, row) for row in rows]
+
+
+### Validation Functions ----------------------------------------------------------------------------------------------
+
+# Split a dataset into k-folds
+def cross_validation_split(dataset, n_folds):
+    dataset_split = list()
+    dataset_copy = list(dataset)
+    fold_size = int(len(dataset) / n_folds)
+    for i in range(n_folds):
+        fold = list()
+        while len(fold) < fold_size:
+            index = randrange(len(dataset_copy))
+            fold.append(dataset_copy.pop(index))
+        dataset_split.append(fold)
+    return dataset_split
+
+
+def cross_validate(dataset, n_folds, max_depth, min_size, sample_proportion, n_trees, n_features):
+    folds = cross_validation_split(dataset, n_folds)
+    scores = list()
+    for fold in folds:
+        # Remove the test fold and flatten the training folds into a single list
+        train_set = list(folds)
+        train_set.remove(fold)
+        train_set = [row for fold in train_set for row in fold]
+        test_set = list()
+        # Wipe the class ID from the test data copy
+        for row in fold:
+            row_copy = list(row)
+            row_copy[-1] = None
+            test_set.append(row_copy)
+        trees, predicted = random_forest(
+            train_set,
+            test_set,
+            max_depth,
+            min_size,
+            sample_proportion,
+            n_trees,
+            n_features
+            )
+        actual = [row[-1] for row in fold]
+        assessment_metrics = confusion_matrix(actual, predicted)
+        scores.append(assessment_metrics)
+    return scores
+
+
+def confusion_matrix(actual, predicted):
+    total = len(actual)
+    y_actu = pd.Series(actual, name='Actual')
+    y_pred = pd.Series(predicted, name='Predicted')
+    cm = pd.crosstab(y_actu, y_pred, rownames=['Actual'], colnames=['Predicted'], margins=True)
+
+    tn = cm[0][0]
+    fn = cm[0][1]
+    fp = cm[1][0]
+    tp = cm[1][1]
+
+    accuracy = (tp+tn) / total                      # Overall, how often is the classifier correct?
+    misclass_rate = (fp+fn) / total                 # Overall, how often is it wrong?
+    tp_rate = tp / (tp+fn)                          # When it's actually yes, how often does it predict yes?  -  Sensitivity/Recall
+    fp_rate = fp / (fp+tn)                          # When it's actually no, how often does it predict yes?
+    tn_rate = tn / (tn+fp)                          # When it's actually no, how often does it predict no?  -  Specificity
+    precision = tp / (tp+fp)                        # When it predicts yes, how often is it correct?
+    prevalence = (fn+tp) / total                    # How often does the yes condition actually occur in the sample?
+    null_error_rate = min(tp+fn, tn+fp) / total     # Error rate when guessing the majority class
+
+    f_score = 2 * ((precision * tp_rate) / (precision + tp_rate))
+
+    p_yes = ( ((tp+fn) / total) * ((tp+fp) / total) )
+    p_no =  ( ((fp+tn) / total) * ((fn+tn) / total) )
+    pe = p_yes + p_no
+    cohens_kappa = 1 - ((1-accuracy) / (1-pe))
+
+    return {
+        'Confusion Matrix': cm,
+        'True Negatives': tn,
+        'True Positives': tp,
+        'False Negatives': fn,
+        'False Positives': fp,
+        'Accuracy' : accuracy,
+        'Misclassification Rate': misclass_rate,
+        'True Positive Rate': tp_rate,
+        'False Positive Rate': fp_rate,
+        'True Negative Rate': tn_rate,
+        'Precision': precision,
+        'Prevalence': prevalence,
+        'Null Error Rate': null_error_rate,
+        'F-Score': f_score,
+        'Cohens Kappa': cohens_kappa,
+    }
+
+
 #--- Custom Exceptions ------------------------------------------------------------------------------------------------
+
 class InsufficientSurveyCoverage (BaseException): pass
 class InsufficientSiteSample (BaseException): pass
 class ExcessPoints (BaseException): pass
 class GuessedTheMean (BaseException): pass
 
 
-
 #--- Main Program -----------------------------------------------------------------------------------------------------
+
 class Toolbox(object):
     def __init__(self):
         self.label = "Easy Random Forest Toolbox"
@@ -446,14 +680,13 @@ class Easy_Random_Forest(object):
         ) = params
 
         # Seed the RNG
-        # BUG: this is not setting the seed thoughout - probably losing the seed on import random_forest
-        random.seed(random_seed.value)
+        seed(random_seed.value)
 
         try:
             #--- Create Geodatabase ----------------------------------------------------------------------------------------------
 
             # Date/time stamp for outputs
-            dt_stamp = re.sub('[^0-9]', '', str(datetime.datetime.now())[:16])
+            dt_stamp = sub('[^0-9]', '', str(datetime.now())[:16])
 
             # Output fGDB name and full path
             file_name = os.path.splitext(os.path.basename(__file__))[0] # Name outputs with tool name and date
@@ -535,10 +768,8 @@ class Easy_Random_Forest(object):
 
             # Get the analysis area extent coordinates
             desc = arcpy.Describe(analysis_area)
-            xmin = desc.extent.XMin
-            xmax = desc.extent.XMax
-            ymin = desc.extent.YMin
-            ymax = desc.extent.YMax
+            xmin, xmax = desc.extent.XMin, desc.extent.XMax
+            ymin, ymax = desc.extent.YMin, desc.extent.YMax
 
             # Create fishnet
             arcpy.AddMessage('Creating sample point cloud')
@@ -571,7 +802,7 @@ class Easy_Random_Forest(object):
                 out_name=os.path.basename(site_points),
                 constraining_feature_class=analysis_sites,
                 number_of_points_or_field=(site_acres_total * site_sample_points_per_acres) / site_count,
-                minimum_allowed_distance="{} Meters".format(np.sqrt(sample_spacing.value)),
+                minimum_allowed_distance="{} Meters".format(sqrt(sample_spacing.value)),
                 )
 
             # Append site oversample to sample points and delete
@@ -701,33 +932,33 @@ class Easy_Random_Forest(object):
             # Max Features - must be less than number of features in df
             # TODO: Enforce don't use all? - SHould this even be an option?
             n_features = min(max_features.value, len(train_dataset[0]) - 1)
-            # n_features = int(math.sqrt(len(train_dataset[0])-1))
+            # n_features = int(sqrt(len(train_dataset[0])-1))
 
             arcpy.AddMessage(f'Training model with {site_points} site points and {non_site_points} non-site points')
-            site_class_proportion = (site_points / non_site_points)
+            site_class_proportion = (site_points / (site_points + non_site_points))
             site_class_percentage = round(site_class_proportion * 100, 2)
             non_site_class_percentage = round(100 - site_class_percentage, 2)
             arcpy.AddMessage(f'Class balance: {site_class_percentage}% site points, {non_site_class_percentage}% non-site points')
 
         # --- Random Forest --------------------------------------------------------------------------------------------
 
-            # TODO: make this optional?
-            # K-Fold cross-validation
-            arcpy.AddMessage('Cross-validating model')
-            cross_validation_scores = random_forest.cross_validate(
-                train_dataset,
-                k_folds.value,
-                max_depth.value,
-                min_split.value,
-                sample_prop.value,
-                n_trees.value,
-                n_features
-                )
-            arcpy.AddMessage(f'Cross-Validation Scores: {cross_validation_scores}')
+            if k_folds.value:
+                # K-Fold cross-validation
+                arcpy.AddMessage('Cross-validating model')
+                cross_validation_scores = cross_validate(
+                    train_dataset,
+                    k_folds.value,
+                    max_depth.value,
+                    min_split.value,
+                    sample_prop.value,
+                    n_trees.value,
+                    n_features
+                    )
+                arcpy.AddMessage(f'Cross-Validation Scores: {cross_validation_scores}')
 
             # Build the final model on the whole training set
             arcpy.AddMessage('Building the final model')
-            final_model, final_predictions = random_forest.random_forest(
+            final_model, final_predictions = random_forest(
                 train_dataset,
                 test_dataset,
                 max_depth.value,
@@ -737,9 +968,12 @@ class Easy_Random_Forest(object):
                 n_features,
                 )
             # Final accuracy metric
-            confusion_matrix = random_forest.confusion_matrix(test_actuals, final_predictions)
-            arcpy.AddMessage(confusion_matrix)
+            assessment_metrics = confusion_matrix(test_actuals, final_predictions)
+            arcpy.AddMessage(assessment_metrics['Confusion Matrix'])
+            for metric_name, val in sorted(assessment_metrics.items()):
+                arcpy.AddMessage(f'{metric_name}: {val}')
 
+            # TODO: Better way to handle?
             # Guard against no site predictions - throws list index error..
             if len(set(final_predictions)) == 1:
                 raise GuessedTheMean
@@ -748,16 +982,15 @@ class Easy_Random_Forest(object):
             arcpy.AddMessage('Adding predictions to unsurveyed areas')
             predict_df.drop(columns=[class_field], inplace=True)
             prediction_dataset = predict_df.values.tolist()
-            predictions = random_forest.predict_dataset(final_model, prediction_dataset)
+            predictions = predict_dataset(final_model, prediction_dataset)
 
             arcpy.AddMessage(
                 f'Unsurveyed area predictions: {predictions.count(1)} sites points, {predictions.count(0)} non-site points'
                 )
 
-            # join predictions to original point data
+            # Join predictions to original point data
             final_predict_field = 'Final_Prediction'
             arcpy.management.AddField(prediction_points, final_predict_field, 'Short')
-            # TODO: Does this maintain the correct order??
             with arcpy.da.UpdateCursor(prediction_points, final_predict_field) as cur:
                 for ix, row in enumerate(cur):
                     row[0] = predictions[ix]
@@ -795,10 +1028,9 @@ class Easy_Random_Forest(object):
                 "[exiting program]")
             arcpy.AddError(msg)
 
-        except:
-            # [Rails]  <-- -->  [Car]
-            err = str(traceback.format_exc())
-            arcpy.AddError(err)
+        # except:
+        #     err = str(traceback.format_exc())s
+        #     arcpy.AddError(err)
 
         finally:
             arcpy.management.Delete('memory')
